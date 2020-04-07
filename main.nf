@@ -28,6 +28,7 @@ def helpMessage() {
     Options:
       --genome [str]                  Name of iGenomes reference
       --single_end [bool]             Specifies that the input is single-end reads
+      --reads_are_fasta [bool]        Specifies that input reads are fasta files (skip trimming steps)
 
     References                        If not specified in the configuration file or you wish to overwrite any of the references
       --fasta [file]                  Path to fasta reference
@@ -124,13 +125,22 @@ if (params.bam && params.bed && params.bai && !(params.reads || params.readPaths
   // * Create a channel for input read files
   if (params.readPaths) {
   	if (params.single_end) {
-      Channel
-        .from(params.readPaths)
-        .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true) ] ] }
-        .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-        .dump(tag: "reads_single_end")
-        .into { ch_read_files_fastqc; ch_read_files_trimming; ch_read_files_extract_coding }
-  	} else {
+        if (params.reads_are_fasta) {
+            Channel
+                .from(params.readPaths)
+                .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true) ] ] }
+                .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
+                .dump(tag: "reads_single_end")
+                .into { ch_reads_trimmed_nonempty; ch_read_files_extract_coding } // ch_read_files_extract_coding not used anywhere!?
+        } else {
+          Channel
+            .from(params.readPaths)
+            .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true) ] ] }
+            .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
+            .dump(tag: "reads_single_end")
+            .into { ch_read_files_fastqc; ch_read_files_trimming; ch_read_files_extract_coding }
+  	 }
+    } else {
       Channel
         .from(params.readPaths)
         .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true), file(row[1][1], checkIfExists: true) ] ] }
@@ -333,26 +343,28 @@ if (params.bam && params.bed && params.bai) {
 /*
  * STEP 1 - FastQC
  */
-process fastqc {
-    tag "$name"
-    label 'process_medium'
-    publishDir "${params.outdir}/fastqc", mode: 'copy',
-        saveAs: { filename ->
-                      filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename"
-                }
 
-    input:
-    set val(name), file(reads) from ch_read_files_fastqc
+if (!params.reads_are_fasta) {
+    process fastqc {
+        tag "$name"
+        label 'process_medium'
+        publishDir "${params.outdir}/fastqc", mode: 'copy',
+            saveAs: { filename ->
+                          filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename"
+                    }
 
-    output:
-    file "*_fastqc.{zip,html}" into ch_fastqc_results
+        input:
+        set val(name), file(reads) from ch_read_files_fastqc
 
-    script:
-    """
-    fastqc --quiet --threads $task.cpus $reads
-    """
+        output:
+        file "*_fastqc.{zip,html}" into ch_fastqc_results
+
+        script:
+        """
+        fastqc --quiet --threads $task.cpus $reads
+        """
+    }
 }
-
 
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
@@ -365,46 +377,48 @@ process fastqc {
  * STEP 2 - fastp for read trimming
  */
 
-process fastp {
-    label 'process_low'
-    tag "$name"
-    publishDir "${params.outdir}/fastp", mode: 'copy'
+if (!params.reads_are_fasta) {
+    process fastp {
+        label 'process_low'
+        tag "$name"
+        publishDir "${params.outdir}/fastp", mode: 'copy'
 
-    input:
-    set val(name), file(reads) from ch_read_files_trimming
+        input:
+        set val(name), file(reads) from ch_read_files_trimming
 
-    output:
-    set val(name), file("*trimmed.fastq.gz") into ch_reads_trimmed
-    file "*fastp.json" into ch_fastp_results
-    file "*fastp.html" into ch_fastp_html
+        output:
+        set val(name), file("*trimmed.fastq.gz") into ch_reads_trimmed
+        file "*fastp.json" into ch_fastp_results
+        file "*fastp.html" into ch_fastp_html
 
-    script:
-    if (params.single_end) {
-        """
-        fastp \\
-            --in1 ${reads} \\
-            --out1 ${name}_R1_trimmed.fastq.gz \\
-            --json ${name}_fastp.json \\
-            --html ${name}_fastp.html
-        """
-    } else {
-        """
-        fastp \\
-            --in1 ${reads[0]} \\
-            --in2 ${reads[1]} \\
-            --out1 ${name}_R1_trimmed.fastq.gz \\
-            --out2 ${name}_R2_trimmed.fastq.gz \\
-            --json ${name}_fastp.json \\
-            --html ${name}_fastp.html
-        """
+        script:
+        if (params.single_end) {
+            """
+            fastp \\
+                --in1 ${reads} \\
+                --out1 ${name}_R1_trimmed.fastq.gz \\
+                --json ${name}_fastp.json \\
+                --html ${name}_fastp.html
+            """
+        } else {
+            """
+            fastp \\
+                --in1 ${reads[0]} \\
+                --in2 ${reads[1]} \\
+                --out1 ${name}_R1_trimmed.fastq.gz \\
+                --out2 ${name}_R2_trimmed.fastq.gz \\
+                --json ${name}_fastp.json \\
+                --html ${name}_fastp.html
+            """
+        }
     }
-}
 
-// filter out empty fastq files
-ch_reads_trimmed
-    // gzipped files are 20 bytes when empty
-    .filter{ it[1].size() > 20 }
-    .set { ch_reads_trimmed_nonempty }
+    // filter out empty fastq files
+    ch_reads_trimmed
+        // gzipped files are 20 bytes when empty
+        .filter{ it[1].size() > 20 }
+        .set { ch_reads_trimmed_nonempty }
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
@@ -674,31 +688,34 @@ process diamond_blastp {
 /*
  * STEP 8 - MultiQC
  */
-process multiqc {
-    publishDir "${params.outdir}/MultiQC", mode: 'copy'
 
-    input:
-    file (multiqc_config) from ch_multiqc_config
-    file (mqc_custom_config) from ch_multiqc_custom_config.collect().ifEmpty([])
-    // TODO nf-core: Add in log files from your new processes for MultiQC to find!
-    file ('fastqc/*') from ch_fastqc_results.collect().ifEmpty([])
-    file ('software_versions/*') from ch_software_versions_yaml.collect()
-    file ("fastp/*") from ch_fastp_results.collect().ifEmpty([])
-    file workflow_summary from ch_workflow_summary.collectFile(name: "workflow_summary_mqc.yaml")
+if (!params.reads_are_fasta) {
+    process multiqc {
+        publishDir "${params.outdir}/MultiQC", mode: 'copy'
 
-    output:
-    file "*multiqc_report.html" into ch_multiqc_report
-    file "*_data"
-    file "multiqc_plots"
+        input:
+        file (multiqc_config) from ch_multiqc_config
+        file (mqc_custom_config) from ch_multiqc_custom_config.collect().ifEmpty([])
+        // TODO nf-core: Add in log files from your new processes for MultiQC to find!
+        file ('fastqc/*') from ch_fastqc_results.collect().ifEmpty([])
+        file ('software_versions/*') from ch_software_versions_yaml.collect()
+        file ("fastp/*") from ch_fastp_results.collect().ifEmpty([])
+        file workflow_summary from ch_workflow_summary.collectFile(name: "workflow_summary_mqc.yaml")
 
-    script:
-    rtitle = custom_runName ? "--title \"$custom_runName\"" : ''
-    rfilename = custom_runName ? "--filename " + custom_runName.replaceAll('\\W','_').replaceAll('_+','_') + "_multiqc_report" : ''
-    custom_config_file = params.multiqc_config ? "--config $mqc_custom_config" : ''
-    // TODO nf-core: Specify which MultiQC modules to use with -m for a faster run time
-    """
-    multiqc -f $rtitle $rfilename $custom_config_file -m fastqc -m fastp .
-    """
+        output:
+        file "*multiqc_report.html" into ch_multiqc_report
+        file "*_data"
+        file "multiqc_plots"
+
+        script:
+        rtitle = custom_runName ? "--title \"$custom_runName\"" : ''
+        rfilename = custom_runName ? "--filename " + custom_runName.replaceAll('\\W','_').replaceAll('_+','_') + "_multiqc_report" : ''
+        custom_config_file = params.multiqc_config ? "--config $mqc_custom_config" : ''
+        // TODO nf-core: Specify which MultiQC modules to use with -m for a faster run time
+        """
+        multiqc -f $rtitle $rfilename $custom_config_file -m fastqc -m fastp .
+        """
+    }
 }
 
 /*
